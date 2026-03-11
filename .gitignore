@@ -177,3 +177,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+dcgm/
+scancel_jobs.py
+*.sh

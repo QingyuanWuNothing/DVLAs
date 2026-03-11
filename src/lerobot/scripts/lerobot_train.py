@@ -40,6 +40,7 @@ from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.utils.observation_delay import ObservationDelayBuffer
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
@@ -474,6 +475,30 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+                # Build observation delay buffer for online eval when delay is configured.
+                eval_delay_buffer = None
+                _has_nonzero_delay = cfg.observation_delay_default > 0 or any(
+                    d > 0 for d in cfg.observation_delay_steps.values()
+                )
+                if _has_nonzero_delay:
+                    # Load belief model if configured.
+                    belief_model = None
+                    if cfg.delay_compensation == "belief":
+                        if not cfg.belief_model_path:
+                            raise ValueError(
+                                "delay_compensation='belief' requires belief_model_path."
+                            )
+                        from lerobot.utils.belief_predictor import load_belief_model
+                        belief_model = load_belief_model(
+                            cfg.belief_model_path, device=str(policy.device)
+                        )
+                    eval_delay_buffer = ObservationDelayBuffer(
+                        delay_steps=dict(cfg.observation_delay_steps),
+                        default_delay=cfg.observation_delay_default,
+                        delay_compensation=cfg.delay_compensation,
+                        belief_keys=list(cfg.delay_compensation_keys),
+                        belief_model=belief_model,
+                    )
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
@@ -487,6 +512,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        observation_delay_buffer=eval_delay_buffer,
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]

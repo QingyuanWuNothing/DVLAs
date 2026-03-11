@@ -714,6 +714,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
+        # Delay compensation config (set by make_dataset when delay-aware training is enabled).
+        # These mirror the fields in ObservationDelayBuffer but are applied offline in __getitem__.
+        self._delay_compensation: str = "none"  # "none" or "belief"
+        self._delay_compensation_keys: list[str] = []
+        self._delay_steps: dict[str, int] = {}
+        self._delay_default: int = 0
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
@@ -1076,6 +1082,53 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.hf_dataset = self.load_hf_dataset()
             self._lazy_loading = False
 
+    def _get_obs_delay(self, key: str) -> int:
+        """Return the delay (in frames) configured for an observation key."""
+        sorted_prefixes = sorted(self._delay_steps.items(), key=lambda x: len(x[0]), reverse=True)
+        for prefix, delay in sorted_prefixes:
+            if key.startswith(prefix):
+                return delay
+        return self._delay_default
+
+    def _apply_offline_delay_compensation(self, item: dict, abs_idx: int, ep_idx: int) -> dict:
+        """Compensate delayed state observations with actions from the delay window.
+
+        For each key in ``_delay_compensation_keys``, this queries the action values
+        at indices ``[abs_idx - d, …, abs_idx - 1]`` (clamped to episode
+        boundaries) and applies the configured compensation mode.
+        """
+        ep = self.meta.episodes[ep_idx]
+        ep_start = ep["dataset_from_index"]
+        ep_end = ep["dataset_to_index"]
+
+        for key in list(item.keys()):
+            if not any(key.startswith(prefix) for prefix in self._delay_compensation_keys):
+                continue
+
+            d = self._get_obs_delay(key)
+            if d == 0:
+                continue
+
+            # Collect action indices in the delay window: [abs_idx - d, ..., abs_idx - 1]
+            action_indices = [max(ep_start, min(ep_end - 1, abs_idx - d + i)) for i in range(d)]
+
+            # Map to relative indices if needed
+            relative_indices = (
+                action_indices
+                if self._absolute_to_relative_idx is None
+                else [self._absolute_to_relative_idx[idx] for idx in action_indices]
+            )
+
+            # Query action values from the dataset
+            try:
+                actions = torch.stack(self.hf_dataset["action"][relative_indices])
+            except (KeyError, TypeError, IndexError):
+                actions = torch.stack([self.hf_dataset[ri]["action"] for ri in relative_indices])
+
+            # Only "none" compensation is supported offline — no state modification.
+
+        return item
+
     def __len__(self):
         return self.num_frames
 
@@ -1095,9 +1148,53 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for key, val in query_result.items():
                 item[key] = val
 
+        # Apply observation delay for keys NOT covered by delta_indices.
+        # This handles the case where the policy has no frame stacking
+        # (observation_delta_indices is None) but delay is configured.
+        # We load delayed observations directly to preserve the original
+        # tensor shape (avoiding an unwanted stacking dimension).
+        _has_delay = self._delay_default > 0 or any(d > 0 for d in self._delay_steps.values())
+        delayed_video_overrides: dict[str, float] = {}
+        if _has_delay:
+            ep = self.meta.episodes[ep_idx]
+            ep_start = ep["dataset_from_index"]
+            ep_end = ep["dataset_to_index"]
+            for key in list(item.keys()):
+                if not key.startswith("observation."):
+                    continue
+                # Skip keys already shifted via delta_indices / frame stacking.
+                if self.delta_indices is not None and key in self.delta_indices:
+                    continue
+                d = self._get_obs_delay(key)
+                if d == 0:
+                    continue
+                delayed_abs = max(ep_start, min(ep_end - 1, abs_idx - d))
+                rel = (
+                    delayed_abs
+                    if self._absolute_to_relative_idx is None
+                    else self._absolute_to_relative_idx[delayed_abs]
+                )
+                if key in self.meta.video_keys:
+                    # Collect delayed timestamp; video frames are loaded later.
+                    ts = self.hf_dataset[rel]["timestamp"]
+                    delayed_video_overrides[key] = ts.item() if hasattr(ts, "item") else float(ts)
+                    continue
+                try:
+                    item[key] = self.hf_dataset[key][rel]
+                except (KeyError, TypeError, IndexError):
+                    item[key] = self.hf_dataset[rel][key]
+
+        # Offline delay compensation: compensate delayed state observations with
+        # actions from the delay window [t-δ, …, t-1].
+        if self._delay_compensation != "none" and self._delay_compensation_keys:
+            item = self._apply_offline_delay_compensation(item, abs_idx, ep_idx)
+
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
+            # Override timestamps for delayed video keys not handled by delta_indices.
+            for vid_key, delayed_ts in delayed_video_overrides.items():
+                query_timestamps[vid_key] = [delayed_ts]
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 

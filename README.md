@@ -1,159 +1,278 @@
+# Benchmarking Observation Delays in Vision-Language-Action Models (Under Development)
+
 <p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
 </p>
 
-<div align="center">
+A **research fork** of [LeRobot](https://github.com/huggingface/lerobot) for systematically benchmarking how per-modality sensor latency degrades VLA policy performance, and whether a learned belief predictor can recover it. All original LeRobot functionality is preserved — delay simulation activates only when explicitly configured.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+---
 
-</div>
+## Table of Contents
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+- [Motivation](#motivation)
+- [Results](#results)
+- [Quick Start](#quick-start)
+- [Belief Prediction](#belief-prediction)
+- [Observation Masking](#observation-masking)
+- [What This Fork Modifies](#what-this-fork-modifies)
+- [Installation](#installation)
+- [Citation](#citation)
+- [Acknowledgments](#acknowledgments)
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+---
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+## Motivation
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+VLA policies are trained and evaluated under ideal zero-delay conditions, but real deployments face **sensor latency**: cameras incur capture-and-transfer delays, proprioceptive readings lag behind the control loop, and network communication introduces jitter. Their behavior under realistic latency is poorly understood.
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+### Why Belief Prediction Instead of State Augmentation?
+
+A natural compensation strategy is **state augmentation** — appending action history to the observation. This is incompatible with pretrained VLAs for two reasons:
+
+1. **Input dimension mismatch.** In LIBERO, state is 8-D (`eef_pos(3) + eef_axisangle(3) + gripper_qpos(2)`), images come from two cameras (`observation.images.image` and `observation.images.wrist_image`, both 256×256×3), and each action is 7-D (`Δpos(3) + Δaxisangle(3) + gripper_cmd(1)`). With delay δ the input becomes `8 + 7δ`-dimensional, breaking the pretrained input projection.
+
+2. **Nonlinear state–action relationship.** Rotations compose on SO(3) via the Rodrigues formula, and the gripper responds to binary commands through non-trivial dynamics — simple delta accumulation is physically incorrect.
+
+**Our solution:** train a small GRU-based **belief predictor** `(delayed_state, action_history) → predicted_current_state` that outputs in the **same 8-D space**, requiring zero VLA architectural change. A single ~50K-parameter model handles variable delay δ ∈ {1, …, δ_max} via variable-length GRU processing.
+
+---
+
+## Results
+
+### Delay vs. Task Success Rate (LIBERO)
+
+**Symmetric Delay** ($\delta_{\mathrm{img}}=\delta_{\mathrm{state}}=\delta$)
+<p align="center">
+  <img src="results/symmetric_delay.png" width="95%" />
+</p>
+
+**Image-Only Delay** ($\delta_{\mathrm{img}}=\delta,\ \delta_{\mathrm{state}}=0$)
+<p align="center">
+  <img src="results/image_only_delay.png" width="95%" />
+</p>
+
+**State-Only Delay** ($\delta_{\mathrm{img}}=0,\ \delta_{\mathrm{state}}=\delta$)
+<p align="center">
+  <img src="results/state_only_delay.png" width="95%" />
+</p>
+
+Detailed per-task tables: **[PI0](results/results_summary_pi0.md)** | **[PI0.5](results/results_summary_pi05.md)**
+
+Regenerate with `python summarize_eval.py`.
+
+---
 
 ## Quick Start
 
-LeRobot can be installed directly from PyPI.
-
 ```bash
-pip install lerobot
-lerobot-info
-```
-
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
-
-## Robots & Control
-
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
-
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
-
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
-```
-
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
-
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
-
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
-
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
-
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
-
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
-
-```bash
-lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
-```
-
-| Category                   | Models                                                                                                                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md)                                                             |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                  |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx) |
-
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
-
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
-
-```bash
-# Evaluate a policy on the LIBERO benchmark
+# Symmetric 1-step delay on LIBERO
 lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
   --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --policy.path=lerobot/pi0_libero_finetuned \
+  --observation_delay_steps='{"observation.images": 1, "observation.state": 1}'
+
+# Image-only delay (4 steps), state real-time
+lerobot-eval ... \
+  --observation_delay_steps='{"observation.images": 4, "observation.state": 0}'
+
+# State-only delay (8 steps), images real-time
+lerobot-eval ... \
+  --observation_delay_steps='{"observation.images": 0, "observation.state": 8}'
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+Output directories encode delay parameters automatically:
+```
+outputs/eval/2026-03-08/14-04-55_libero_pi0_delay_images4_state0_comp-none/
+```
 
-## Resources
+Without `--observation_delay_steps`, behavior is identical to upstream LeRobot.
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+---
+
+## Belief Prediction (Experimental)
+
+The belief system uses a **shared-backbone architecture**: modality-specific encoder/decoder heads are connected to a single shared GRU that processes the action sequence. All modalities are predicted in a **single forward pass**, enabling cross-modal information flow through the shared backbone.
+
+```
+state_delayed  →  StateEncoder  → latent_s ─┐
+image1_delayed →  ImageEncoder1 → latent_i1 ─┼── concat → SharedGRU(actions) → h_final
+image2_delayed →  ImageEncoder2 → latent_i2 ─┘                                   │
+                                                    ┌───────── split ─────────────┘
+                                                    ↓           ↓             ↓
+                                              StateDec    ImgDec1       ImgDec2
+                                                    ↓           ↓             ↓
+                                              + residual   + residual    + residual
+```
+
+| Component | Architecture | Typical params |
+|-----------|-------------|---------------|
+| **State encoder** | MLP → latent | ~33K |
+| **Image encoder** | CNN (4-stage) → pool → FC → latent | ~600K each |
+| **Shared GRU** | 2-layer GRU, hidden=256 | ~1M |
+| **State decoder** | latent → MLP → state_dim | ~66K |
+| **Image decoder** | FC → reshape → transposed CNN | ~600K each |
+| **Total** (state + 2 images) | — | **~3–4M** |
+
+**Train from one dataset** (default trains all modalities: state + main camera + wrist camera):
+```bash
+python -m lerobot.scripts.train_belief \
+  --repo_id lerobot/libero_goal_image \
+  --delays 1 2 4 8 16 32 \
+  --epochs 100 \
+  --output_dir outputs/belief
+```
+
+**Train from ALL LIBERO suites** (recommended for best generalization):
+```bash
+python -m lerobot.scripts.train_belief \
+  --repo_id lerobot/libero_spatial_image \
+            lerobot/libero_object_image \
+            lerobot/libero_goal_image \
+            lerobot/libero_10_image \
+  --delays 1 2 4 8 16 32 \
+  --output_dir outputs/belief_all
+```
+
+**Multi-GPU training** (automatically splits data across GPUs):
+```bash
+# Via torchrun (interactive)
+torchrun --nproc_per_node=4 -m lerobot.scripts.train_belief \
+  --repo_id lerobot/libero_spatial_image \
+            lerobot/libero_object_image \
+            lerobot/libero_goal_image \
+            lerobot/libero_10_image \
+  --delays 1 2 4 8 16 32 \
+  --batch_size 64 \
+  --output_dir outputs/belief_all \
+  --epochs 10 \
+  --debug 10000
+```
+
+> Each GPU processes `batch_size` samples per step, so effective batch
+> size = `batch_size × num_gpus`.  The script auto-detects `torchrun`
+> environment variables and uses `DistributedDataParallel` + `DistributedSampler`.
+
+**Evaluate with belief compensation:**
+```bash
+lerobot-eval \
+  --env.type=libero \
+  --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+  --env.max_parallel_tasks=1 \
+  --eval.batch_size=1 \
+  --eval.n_episodes=10 \
+  --policy.path=lerobot/pi0_libero_finetuned \
+  --policy.n_action_steps=10 \
+  --observation_delay_steps='{"observation.images": 4, "observation.state": 4}' \
+  --delay_compensation=belief \
+  --delay_compensation_keys='["observation.state", "observation.images"]' \
+  --belief_model_path=outputs/belief_all
+```
+
+**Custom predictor** — subclass `BaseBeliefPredictor` and register:
+```python
+from lerobot.utils.belief_predictor import BaseBeliefPredictor, register_belief_predictor
+
+@register_belief_predictor("my_predictor")
+class MyPredictor(BaseBeliefPredictor):
+    CONFIG_CLS = MyConfig  # dataclass with save()/load()
+    def __init__(self, cfg): ...
+    def forward(self, delayed_obs, action_seq): ...
+```
+
+---
+
+## Observation Masking
+
+A debug utility for diagnosing **modality sensitivity**: zero-out selected observation channels to measure each model's dependence on state vs. images.
+
+```bash
+# Mask state → test image-only performance
+lerobot-eval \
+  --env.type=libero \
+  --policy.path=lerobot/pi0_libero_finetuned \
+  --observation_mask_keys='["observation.state"]'
+
+# Mask images → test state-only performance
+lerobot-eval ... \
+  --observation_mask_keys='["observation.images"]'
+
+# Mask both (sanity check — policy sees nothing)
+lerobot-eval ... \
+  --observation_mask_keys='["observation.state", "observation.images"]'
+```
+
+Masking works **independently of delay** — use it standalone or combine with delay:
+```bash
+# Delay + mask: 4-step image delay with state zeroed out
+lerobot-eval ... \
+  --observation_delay_steps='{"observation.images": 4, "observation.state": 0}' \
+  --observation_mask_keys='["observation.state"]'
+```
+
+Output directories encode mask parameters automatically:
+```
+outputs/eval/2026-03-10/14-00-00_libero_pi0_mask-state/
+outputs/eval/2026-03-10/14-00-00_libero_pi0_mask-images/
+outputs/eval/2026-03-10/14-00-00_libero_pi0_mask-images+state/
+outputs/eval/2026-03-10/14-00-00_libero_pi0_delay_images4_state0_comp-none_mask-state/
+```
+
+---
+
+## What This Fork Modifies
+
+All changes are **additive and backward-compatible**.
+
+| Component | File(s) | Summary |
+|-----------|---------|---------|
+| Delay buffer | `utils/observation_delay.py` *(new)* | Per-key FIFO delay with prefix matching, shared-backbone belief integration, and observation masking |
+| Belief models | `utils/belief_predictor.py` *(new)* | SharedBackboneBeliefPredictor (shared GRU + modality heads) + legacy per-modality predictors |
+| Belief training | `scripts/train_belief.py` *(new)* | Joint training of all modalities in single forward passes |
+| Configs | `configs/eval.py`, `configs/train.py` | Delay + compensation + masking fields; delay/mask-aware output naming |
+| Dataset | `datasets/factory.py`, `datasets/lerobot_dataset.py` | Offline delay shift in `delta_timestamps` |
+| Eval / Train | `scripts/lerobot_eval.py`, `scripts/lerobot_train.py` | Online delay buffer + belief model + masking in rollout |
+
+All paths relative to `src/lerobot/`.
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/QingyuanWuNothing/DelayedVLAs.git
+cd DelayedVLAs
+pip install -e ".[dev]"
+```
+
+For platform-specific setup, see the upstream [Installation Guide](https://huggingface.co/docs/lerobot/installation). Full [LeRobot documentation](https://huggingface.co/docs/lerobot/index) applies — all original features (ACT, Diffusion, PI0, SmolVLA, GR00T, hardware control, etc.) are preserved.
+
+---
 
 ## Citation
 
-If you use LeRobot in your research, please cite:
-
 ```bibtex
-@misc{cadene2024lerobot,
-    author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
-    title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
-    year = {2024}
+@inproceedings{cadenelerobot,
+  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
+  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://arxiv.org/abs/2602.22818}
 }
 ```
 
-## Contribute
+```bibtex
+@misc{wu2026delaysvla,
+    title  = {Benchmarking Observation Delays in Vision-Language-Action Models},
+    author = {Wu, Qingyuan and Zhan, Sinong Simon and Wang, Yuhui and Dai, Yanning and Zhu, Qi and Huang, Chao},
+    year   = {2026},
+    url    = {https://github.com/QingyuanWuNothing/DVLAs}
+}
+```
 
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](./CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+---
 
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
+## Acknowledgments
 
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
+Built upon [**LeRobot**](https://github.com/huggingface/lerobot) by the Hugging Face team. Licensed under [Apache 2.0](./LICENSE), same as upstream.

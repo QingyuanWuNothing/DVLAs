@@ -85,6 +85,7 @@ from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.observation_delay import ObservationDelayBuffer
 from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
@@ -102,6 +103,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    observation_delay_buffer: ObservationDelayBuffer | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -139,6 +141,8 @@ def rollout(
     # Reset the policy and environments.
     policy.reset()
     observation, info = env.reset(seed=seeds)
+    if observation_delay_buffer is not None:
+        observation_delay_buffer.reset()
     if render_callback is not None:
         render_callback(env)
 
@@ -172,6 +176,12 @@ def rollout(
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
 
+        # Apply observation delay (and optional state augmentation) AFTER
+        # env_preprocessor so that observation keys are in their canonical
+        # form (e.g. "observation.state" instead of "observation.robot_state").
+        if observation_delay_buffer is not None:
+            observation = observation_delay_buffer.delay_and_augment(observation)
+
         observation = preprocessor(observation)
         with torch.inference_mode():
             action = policy.select_action(observation)
@@ -180,6 +190,11 @@ def rollout(
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
         action = action_transition[ACTION]
+
+        # Record the executed action so the delay buffer can use it for
+        # state augmentation at the next step.
+        if observation_delay_buffer is not None:
+            observation_delay_buffer.push_action(action)
 
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
@@ -259,6 +274,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    observation_delay_buffer: ObservationDelayBuffer | None = None,
 ) -> dict:
     """
     Args:
@@ -346,6 +362,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            observation_delay_buffer=observation_delay_buffer,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -548,6 +565,46 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
+    # Build observation delay buffer if configured (delay and/or masking).
+    delay_buffer = None
+    _has_nonzero_delay = cfg.observation_delay_default > 0 or any(
+        d > 0 for d in cfg.observation_delay_steps.values()
+    )
+    _has_mask = bool(getattr(cfg, "observation_mask_keys", None))
+    if _has_nonzero_delay or _has_mask:
+        # Load belief model if configured.
+        belief_model = None
+        if cfg.delay_compensation == "belief":
+            if not cfg.belief_model_path:
+                raise ValueError(
+                    "delay_compensation='belief' requires --belief_model_path."
+                )
+            from lerobot.utils.belief_predictor import load_belief_model
+            belief_model = load_belief_model(cfg.belief_model_path, device=device)
+
+        delay_buffer = ObservationDelayBuffer(
+            delay_steps=cfg.observation_delay_steps,
+            default_delay=cfg.observation_delay_default,
+            delay_compensation=cfg.delay_compensation,
+            belief_keys=cfg.delay_compensation_keys,
+            belief_model=belief_model,
+            mask_keys=getattr(cfg, "observation_mask_keys", []),
+        )
+        comp_label = cfg.delay_compensation
+        if belief_model is not None:
+            comp_label += f" (model={cfg.belief_model_path})"
+        if _has_nonzero_delay:
+            logging.info(
+                colored("Observation delay enabled:", "yellow", attrs=["bold"])
+                + f" per-key={cfg.observation_delay_steps}, default={cfg.observation_delay_default}"
+                + f", compensation={comp_label}"
+            )
+        if _has_mask:
+            logging.info(
+                colored("Observation masking enabled:", "red", attrs=["bold"])
+                + f" mask_keys={cfg.observation_mask_keys}"
+            )
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -561,6 +618,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            observation_delay_buffer=delay_buffer,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -603,6 +661,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    observation_delay_buffer: ObservationDelayBuffer | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -620,6 +679,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        observation_delay_buffer=observation_delay_buffer,
     )
 
     per_episode = task_result["per_episode"]
@@ -646,12 +706,18 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    observation_delay_buffer: ObservationDelayBuffer | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
     Returns (task_group, task_id, task_metrics_dict).
     This function is intentionally module-level to make it easy to test.
     """
+    # Each task needs its own buffer instance to avoid race conditions
+    # when eval_policy_all runs tasks in parallel threads.
+    if observation_delay_buffer is not None:
+        observation_delay_buffer = deepcopy(observation_delay_buffer)
+
     task_videos_dir = None
     if videos_dir is not None:
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
@@ -670,6 +736,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        observation_delay_buffer=observation_delay_buffer,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -691,6 +758,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    observation_delay_buffer: ObservationDelayBuffer | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -746,6 +814,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        observation_delay_buffer=observation_delay_buffer,
     )
 
     if max_parallel_tasks <= 1:

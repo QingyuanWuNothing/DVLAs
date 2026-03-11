@@ -40,6 +40,22 @@ class EvalPipelineConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
     # Explicit consent to execute remote code from the Hub (required for hub environments).
     trust_remote_code: bool = False
+    # Observation delay: mapping from obs key prefix to delay in env steps.
+    # Example: {"observation.image": 3, "observation.state": 1}
+    observation_delay_steps: dict[str, int] = field(default_factory=dict)
+    # Default delay (in steps) for observation keys not matching any prefix above.
+    observation_delay_default: int = 0
+    # Delay compensation mode: "none" (pass-through) or "belief" (learned prediction).
+    delay_compensation: str = "none"
+    # Observation key prefixes whose delayed values are predicted by the belief model.
+    # Supports multiple modalities, e.g. ["observation.state", "observation.images"].
+    delay_compensation_keys: list[str] = field(default_factory=lambda: ["observation.state"])
+    # Path to a trained belief predictor model directory (single or multi-modal).
+    # Required when delay_compensation="belief".
+    belief_model_path: str | None = None
+    # Debug: observation key prefixes to zero-out during evaluation.
+    # Example: ["observation.state"] masks all state; ["observation.images"] masks all images.
+    observation_mask_keys: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -67,6 +83,34 @@ class EvalPipelineConfig:
         if not self.output_dir:
             now = dt.datetime.now()
             eval_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
+
+            # Append delay parameters to the output directory name for easy comparison.
+            _has_nonzero_delay = self.observation_delay_default > 0 or any(
+                d > 0 for d in self.observation_delay_steps.values()
+            )
+            if _has_nonzero_delay:
+                # Build a compact suffix like "delay_image3_state1_aug-none"
+                parts = []
+                for prefix, d in sorted(self.observation_delay_steps.items()):
+                    short_key = prefix.replace("observation.", "").replace(".", "-")
+                    parts.append(f"{short_key}{d}")
+                if self.observation_delay_default > 0:
+                    parts.append(f"default{self.observation_delay_default}")
+                delay_suffix = "_".join(parts)
+                comp = self.delay_compensation
+                eval_dir = f"{eval_dir}_delay_{delay_suffix}_comp-{comp}"
+
+            # Append mask suffix when observation masking is active.
+            # Examples:
+            #   mask_keys=["observation.state"]          → "_mask-state"
+            #   mask_keys=["observation.images"]         → "_mask-images"
+            #   mask_keys=["observation.state",
+            #              "observation.images"]          → "_mask-state+images"
+            if self.observation_mask_keys:
+                mask_parts = [p.replace("observation.", "").replace(".", "-")
+                              for p in sorted(self.observation_mask_keys)]
+                eval_dir = f"{eval_dir}_mask-{'+'.join(mask_parts)}"
+
             self.output_dir = Path("outputs/eval") / eval_dir
 
     @classmethod

@@ -76,6 +76,22 @@ class TrainPipelineConfig(HubMixin):
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+
+    # Observation delay: mapping from obs key prefix to delay in env steps (used for online eval
+    # and offline dataset construction; belief prediction compensates online).
+    observation_delay_steps: dict[str, int] = field(default_factory=dict)
+    observation_delay_default: int = 0
+    # Delay compensation mode: "none" (pass-through) or "belief" (learned prediction).
+    delay_compensation: str = "none"
+    # Path to a trained belief predictor model directory (single or multi-modal).
+    belief_model_path: str | None = None
+    # Observation key prefixes predicted by the belief model.
+    # Supports multiple modalities, e.g. ["observation.state", "observation.images"].
+    delay_compensation_keys: list[str] = field(default_factory=lambda: ["observation.state"])
+    # Debug: observation key prefixes to zero-out during training/eval.
+    # Example: ["observation.state"] masks all state; ["observation.images"] masks all images.
+    observation_mask_keys: list[str] = field(default_factory=list)
+
     checkpoint_path: Path | None = field(init=False, default=None)
 
     def validate(self) -> None:
